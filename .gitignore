@@ -1,0 +1,7 @@
+*
+!*/
+!.gitignore
+!Dockerfile
+!extract.py
+!requirements.txt
+!README.md

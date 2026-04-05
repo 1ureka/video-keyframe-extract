@@ -1,0 +1,6 @@
+opencv-python-headless>=4.9
+scenedetect[opencv]>=0.6
+git+https://github.com/openai/CLIP.git
+Pillow>=10.0
+natsort>=8.0
+tqdm
