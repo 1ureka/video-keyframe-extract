@@ -41,6 +41,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+logging.getLogger("pyscenedetect").setLevel(logging.WARNING)
 
 
 def parse_args():
@@ -224,19 +225,18 @@ def process_video(
 ) -> int:
     """主執行緒 (GPU): 讀幀 + CLIP 推論 + 儲存圖片。"""
     video_path = prepared["video_path"]
-    log.info("▶ [%03d] %s", video_index, video_path.name)
+    display_name = video_path.name if len(video_path.name) <= 50 else video_path.name[:47] + "..."
 
     if prepared["error"]:
-        log.warning("  ✗ 前處理失敗: %s", prepared["error"])
+        log.warning("[%03d] ✗ %s ｜ %s", video_index, display_name, prepared["error"])
         return 0
 
     h264_path = prepared["h264_path"]
     scenes = prepared["scenes"]
-    log.info("  場景數: %d", len(scenes))
 
     cap = cv2.VideoCapture(h264_path)
     if not cap.isOpened():
-        log.warning("  ✗ 無法開啟影片，跳過")
+        log.warning("[%03d] ✗ 無法開啟影片，跳過 ｜ %s", video_index, display_name)
         return 0
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
@@ -268,7 +268,7 @@ def process_video(
         out_path = output_dir / filename
         cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
 
-    log.info("  → 擷取 %d 張圖片", len(all_captures))
+    log.info("[%03d] %d scenes → %d frames ｜ %s", video_index, len(scenes), len(all_captures), display_name)
     return len(all_captures)
 
 
@@ -308,7 +308,7 @@ def main():
             idx: executor.submit(prepare_video, vp, args.cut_threshold) for idx, vp in enumerate(videos, start=1)
         }
 
-        for idx in tqdm(range(1, len(videos) + 1), desc="處理影片"):
+        for idx in tqdm(range(1, len(videos) + 1), desc="處理影片", bar_format="{l_bar}{bar:20}{r_bar}\n"):
             prepared = futures[idx].result()  # 等待此影片轉碼完成
             count = process_video(prepared, idx, output_dir, model, preprocess, device, args)
             total_captures += count
@@ -316,7 +316,7 @@ def main():
             if prepared["tmp_dir"]:
                 shutil.rmtree(prepared["tmp_dir"], ignore_errors=True)
 
-    log.info("═══ 完成！共擷取 %d 張圖片 ═══", total_captures)
+    log.info("完成！共擷取 %d 張圖片", total_captures)
 
 
 if __name__ == "__main__":
