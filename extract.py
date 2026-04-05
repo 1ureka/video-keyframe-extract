@@ -105,12 +105,18 @@ def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]
     return [(s[0].get_seconds(), s[1].get_seconds()) for s in scene_list]
 
 
-def compute_clip_embedding(model, preprocess, frame_bgr, device):
-    """將一個 BGR frame 轉成 CLIP 嵌入向量。"""
-    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    with torch.no_grad():
-        embedding = model.encode_image(preprocess(img).unsqueeze(0).to(device))
-    return embedding
+def compute_clip_embeddings_batch(model, preprocess, frames_bgr, device, batch_size=32):
+    """將多個 BGR frames 批量轉成 CLIP 嵌入向量。"""
+    all_embeddings = []
+    for i in range(0, len(frames_bgr), batch_size):
+        batch_frames = frames_bgr[i : i + batch_size]
+        batch_tensors = torch.stack(
+            [preprocess(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))) for f in batch_frames]
+        ).to(device)
+        with torch.no_grad():
+            embeddings = model.encode_image(batch_tensors)
+        all_embeddings.append(embeddings)
+    return torch.cat(all_embeddings, dim=0)
 
 
 def cosine_distance(a, b):
@@ -131,48 +137,49 @@ def process_scene(
 ) -> list[tuple[float, object]]:
     """
     處理單一場景片段，回傳要捕捉的 [(timestamp, frame), ...]。
-    當總捕捉數達到 max_captures 時提前停止。
+    階段 1：收集所有取樣幀，batch 計算 CLIP embeddings。
+    階段 2：遍歷 embeddings 做捕捉判斷。
     """
-    captures = []
     sample_interval = 1.0 / args.sample_fps
-    current_time = start_sec
-    last_embedding = None
-    last_capture_time = start_sec
     threshold = args.semantic_threshold
 
-    # 首幀必捕
-    frame_no = int(start_sec * fps)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-    ret, frame = cap.read()
-    if not ret:
-        return captures
-
-    last_embedding = compute_clip_embedding(model, preprocess, frame, device)
-    captures.append((start_sec, frame))
-    last_capture_time = start_sec
-    current_time += sample_interval
-
+    # 階段 1：收集所有取樣幀
+    frames = []
+    timestamps = []
+    current_time = start_sec
     while current_time < end_sec:
-        if total_captures + len(captures) >= args.max_captures:
-            break
-
         frame_no = int(current_time * fps)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
         ret, frame = cap.read()
         if not ret:
             break
-
-        embedding = compute_clip_embedding(model, preprocess, frame, device)
-        dist = cosine_distance(last_embedding, embedding)
-        time_since_last = current_time - last_capture_time
-
-        # 語意距離超過閾值，或超過最大間隔保底
-        if dist > threshold or time_since_last >= args.max_interval:
-            captures.append((current_time, frame))
-            last_embedding = embedding
-            last_capture_time = current_time
-
+        frames.append(frame)
+        timestamps.append(current_time)
         current_time += sample_interval
+
+    if not frames:
+        return []
+
+    # batch 計算 embeddings
+    embeddings = compute_clip_embeddings_batch(model, preprocess, frames, device)
+
+    # 階段 2：遍歷 embeddings 做捕捉判斷
+    captures = []
+    last_embedding = embeddings[0]
+    last_capture_time = timestamps[0]
+    captures.append((timestamps[0], frames[0]))  # 首幀必捕
+
+    for i in range(1, len(timestamps)):
+        if total_captures + len(captures) >= args.max_captures:
+            break
+
+        dist = cosine_distance(last_embedding.unsqueeze(0), embeddings[i].unsqueeze(0))
+        time_since_last = timestamps[i] - last_capture_time
+
+        if dist > threshold or time_since_last >= args.max_interval:
+            captures.append((timestamps[i], frames[i]))
+            last_embedding = embeddings[i]
+            last_capture_time = timestamps[i]
 
     return captures
 
