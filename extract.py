@@ -13,7 +13,9 @@ import argparse
 import logging
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import clip
@@ -184,8 +186,35 @@ def process_scene(
     return captures
 
 
+def prepare_video(video_path: Path, cut_threshold: float) -> dict:
+    """
+    CPU worker: 轉碼 + 場景偵測。在背景 thread 執行。
+    回傳 dict 包含 h264_path, scenes, tmp_dir, video_path。
+    """
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        h264_path = transcode_to_h264(str(video_path), tmp_dir)
+        scenes = detect_scenes(h264_path, cut_threshold)
+        return {
+            "video_path": video_path,
+            "h264_path": h264_path,
+            "scenes": scenes,
+            "tmp_dir": tmp_dir,
+            "error": None,
+        }
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return {
+            "video_path": video_path,
+            "h264_path": None,
+            "scenes": None,
+            "tmp_dir": None,
+            "error": str(e),
+        }
+
+
 def process_video(
-    video_path: Path,
+    prepared: dict,
     video_index: int,
     output_dir: Path,
     model,
@@ -193,49 +222,45 @@ def process_video(
     device,
     args,
 ) -> int:
-    """處理單一影片，回傳捕捉圖片數。"""
+    """主執行緒 (GPU): 讀幀 + CLIP 推論 + 儲存圖片。"""
+    video_path = prepared["video_path"]
     log.info("▶ [%03d] %s", video_index, video_path.name)
 
-    # 先轉碼為 H.264 以確保 OpenCV 能讀取 (AV1 等格式不支援)
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        try:
-            h264_path = transcode_to_h264(str(video_path), tmp_dir)
-        except RuntimeError as e:
-            log.warning("  ✗ 轉碼失敗: %s", e)
-            return 0
+    if prepared["error"]:
+        log.warning("  ✗ 前處理失敗: %s", prepared["error"])
+        return 0
 
-        # Stage 1: 硬剪輯偵測
-        scenes = detect_scenes(h264_path, args.cut_threshold)
-        log.info("  場景數: %d", len(scenes))
+    h264_path = prepared["h264_path"]
+    scenes = prepared["scenes"]
+    log.info("  場景數: %d", len(scenes))
 
-        # 開啟影片
-        cap = cv2.VideoCapture(h264_path)
-        if not cap.isOpened():
-            log.warning("  ✗ 無法開啟影片，跳過")
-            return 0
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            fps = 30.0
+    cap = cv2.VideoCapture(h264_path)
+    if not cap.isOpened():
+        log.warning("  ✗ 無法開啟影片，跳過")
+        return 0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
 
-        # Stage 2: 語意取樣 + 最大間隔保底 + 捕捉上限
-        all_captures = []
-        for start_sec, end_sec in scenes:
-            if len(all_captures) >= args.max_captures:
-                break
-            captures = process_scene(
-                cap,
-                fps,
-                start_sec,
-                end_sec,
-                model,
-                preprocess,
-                device,
-                args,
-                total_captures=len(all_captures),
-            )
-            all_captures.extend(captures)
+    # Stage 2: 語意取樣 + 最大間隔保底 + 捕捉上限
+    all_captures = []
+    for start_sec, end_sec in scenes:
+        if len(all_captures) >= args.max_captures:
+            break
+        captures = process_scene(
+            cap,
+            fps,
+            start_sec,
+            end_sec,
+            model,
+            preprocess,
+            device,
+            args,
+            total_captures=len(all_captures),
+        )
+        all_captures.extend(captures)
 
-        cap.release()
+    cap.release()
 
     # 儲存圖片
     for img_idx, (ts, frame) in enumerate(all_captures, start=1):
@@ -271,11 +296,25 @@ def main():
     model.eval()
     log.info("模型載入完成")
 
-    # 批量處理
+    # Pipeline 並行處理：
+    # - Worker thread: ffmpeg 轉碼 + SceneDetect (CPU)
+    # - Main thread: CLIP 推論 + 儲存 (GPU)
     total_captures = 0
-    for idx, video_path in enumerate(tqdm(videos, desc="處理影片"), start=1):
-        count = process_video(video_path, idx, output_dir, model, preprocess, device, args)
-        total_captures += count
+    PREFETCH = 2  # 最多預轉碼幾部
+
+    with ThreadPoolExecutor(max_workers=PREFETCH) as executor:
+        # 提交所有轉碼任務（ThreadPoolExecutor 會自動排隊）
+        futures = {
+            idx: executor.submit(prepare_video, vp, args.cut_threshold) for idx, vp in enumerate(videos, start=1)
+        }
+
+        for idx in tqdm(range(1, len(videos) + 1), desc="處理影片"):
+            prepared = futures[idx].result()  # 等待此影片轉碼完成
+            count = process_video(prepared, idx, output_dir, model, preprocess, device, args)
+            total_captures += count
+            # 清理暫存檔
+            if prepared["tmp_dir"]:
+                shutil.rmtree(prepared["tmp_dir"], ignore_errors=True)
 
     log.info("═══ 完成！共擷取 %d 張圖片 ═══", total_captures)
 
