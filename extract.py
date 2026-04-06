@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import dataclasses
 import os
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
 import cv2
 import clip
@@ -29,6 +31,7 @@ SAMPLE_FPS = 2.0  # 語意取樣頻率 (每秒幾幀)
 MAX_INTERVAL = 6.0  # 最大間隔 (秒)，超過此時間未捕捉則強制捕捉
 MAX_CAPTURES = 15  # 每部影片最多捕捉張數
 JPEG_QUALITY = 95  # 輸出 JPEG 品質
+CONCURRENT_PREPARE = 2  # 同時轉碼 + 場景偵測的執行緒數
 
 
 # Logging setup
@@ -61,6 +64,11 @@ class VideoContext:
     scenes: list[tuple[float, float]] | None
     tmp_dir: str | None
     error: str | None
+
+
+class VideoFragment(NamedTuple):
+    timestamps: list[float]
+    frames: list
 
 
 # Utilities
@@ -132,18 +140,16 @@ def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]
     return [(s[0].get_seconds(), s[1].get_seconds()) for s in scene_list]
 
 
-def sample_frames(
-    reader: cv2.VideoCapture, fps: float, start_sec: float, end_sec: float, sample_fps: float
-) -> tuple[list[float], list]:
-    """從影片片段中按指定頻率取樣幀，回傳 (timestamps, frames)。"""
+def sample_scene_fragment(reader: cv2.VideoCapture, vid_fps: float, start: float, end: float, sample_fps: float) -> VideoFragment | None:
+    """根據場景邊界按指定頻率取樣幀，回傳 VideoFragment"""
     sample_interval = 1.0 / sample_fps
 
     frames = []
     timestamps = []
-    current_time = start_sec
+    current_time = start
 
-    while current_time < end_sec:
-        frame_no = int(current_time * fps)
+    while current_time < end:
+        frame_no = int(current_time * vid_fps)
         reader.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
 
         success, frame = reader.read()
@@ -154,7 +160,10 @@ def sample_frames(
         timestamps.append(current_time)
         current_time += sample_interval
 
-    return timestamps, frames
+    if not frames:
+        return None
+
+    return VideoFragment(timestamps=timestamps, frames=frames)
 
 
 # CLIP utilities
@@ -175,9 +184,7 @@ def compute_clip_embeddings(clip_ctx: CLIPContext, frames_bgr, batch_size=32):
 
     for i in range(0, len(frames_bgr), batch_size):
         batch_frames = frames_bgr[i : i + batch_size]
-        batch_tensors = torch.stack(
-            [preprocess(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))) for f in batch_frames]
-        ).to(device)
+        batch_tensors = torch.stack([preprocess(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))) for f in batch_frames]).to(device)
 
         with torch.no_grad():
             embeddings = model.encode_image(batch_tensors)
@@ -196,7 +203,7 @@ def cosine_distance(a, b):
 
 
 def prepare_video(video_path: Path, cut_threshold: float) -> VideoContext:
-    """CPU worker: 轉碼 + 場景偵測。在背景 thread 執行。"""
+    """將影片轉碼並進行場景偵測，回傳處理影片所需的上下文。"""
     tmp_dir = tempfile.mkdtemp()
 
     try:
@@ -211,37 +218,35 @@ def prepare_video(video_path: Path, cut_threshold: float) -> VideoContext:
         return VideoContext(video_path=video_path, h264_path=None, scenes=None, tmp_dir=None, error=str(e))
 
 
-def process_scene(
-    clip_ctx: CLIPContext, frames: list, timestamps: list[float], args, total_captures: int
-) -> list[tuple[float, object]]:
-    """處理單一場景片段，回傳要捕捉的 [(timestamp, frame), ...]。"""
+def process_fragment(clip_ctx: CLIPContext, fragment: VideoFragment, total_captures: int, args) -> list[tuple[float, object]]:
+    """對場景取樣片段做 CLIP 語意分析，回傳要捕捉的 (timestamp, frame) 幀列表。"""
     threshold = args.semantic_threshold
 
-    embeddings = compute_clip_embeddings(clip_ctx, frames)
+    embeddings = compute_clip_embeddings(clip_ctx, fragment.frames)
 
     # 遍歷 embeddings 做捕捉判斷
     captures = []
     last_embedding = embeddings[0]
-    last_capture_time = timestamps[0]
-    captures.append((timestamps[0], frames[0]))  # 首幀必捕
+    last_capture_time = fragment.timestamps[0]
+    captures.append((fragment.timestamps[0], fragment.frames[0]))  # 首幀必捕
 
-    for i in range(1, len(timestamps)):
+    for i in range(1, len(fragment.timestamps)):
         if total_captures + len(captures) >= args.max_captures:
             break
 
         dist = cosine_distance(last_embedding.unsqueeze(0), embeddings[i].unsqueeze(0))
-        time_since_last = timestamps[i] - last_capture_time
+        time_since_last = fragment.timestamps[i] - last_capture_time
 
         if dist > threshold or time_since_last >= args.max_interval:
-            captures.append((timestamps[i], frames[i]))
+            captures.append((fragment.timestamps[i], fragment.frames[i]))
             last_embedding = embeddings[i]
-            last_capture_time = timestamps[i]
+            last_capture_time = fragment.timestamps[i]
 
     return captures
 
 
 def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, output_dir: Path, args) -> int:
-    """主執行緒 (GPU): 讀幀 + CLIP 推論 + 儲存圖片。"""
+    """對單部影片進行 CLIP 分析並儲存捕捉的幀，回傳捕捉的幀數量。"""
     display_name = format_name(vid_ctx.video_path.name)
 
     if vid_ctx.error:
@@ -255,9 +260,9 @@ def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, ou
         log.warning("[%03d] ✗ 無法開啟影片，跳過 | %s", vid_idx, display_name)
         return 0
 
-    fps = reader.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0
+    vid_fps = reader.get(cv2.CAP_PROP_FPS)
+    if vid_fps <= 0:
+        vid_fps = 30.0
 
     all_captures = []
 
@@ -266,11 +271,11 @@ def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, ou
         if total_captures >= args.max_captures:
             break
 
-        timestamps, frames = sample_frames(reader, fps, start_sec, end_sec, args.sample_fps)
-        if not frames:
+        vid_fragment = sample_scene_fragment(reader, vid_fps, start_sec, end_sec, args.sample_fps)
+        if not vid_fragment:
             continue
 
-        captures = process_scene(clip_ctx, frames, timestamps, args, total_captures)
+        captures = process_fragment(clip_ctx, vid_fragment, total_captures, args)
         all_captures.extend(captures)
 
     reader.release()
@@ -284,14 +289,15 @@ def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, ou
     return len(all_captures)
 
 
+# Main function
+
+
 def main():
     args = parse_args()
 
-    # 建立輸出目錄
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 列出影片
     videos = list_videos(args.video_dir)
     if not videos:
         log.error("在 %s 中找不到任何影片", args.video_dir)
@@ -299,29 +305,30 @@ def main():
 
     if args.limit > 0:
         videos = videos[: args.limit]
+
     log.info("共 %d 部影片待處理", len(videos))
 
     log.info("載入 CLIP ViT-B/32 中...")
     clip_ctx = load_clip()
     log.info("CLIP ViT-B/32 (device=%s) 載入完成", clip_ctx.device)
 
-    # Pipeline 並行處理：
-    # - Worker thread: ffmpeg 轉碼 + SceneDetect (CPU)
-    # - Main thread: CLIP 推論 + 儲存 (GPU)
     total_captures = 0
-    PREFETCH = 2  # 最多預轉碼幾部
 
-    with ThreadPoolExecutor(max_workers=PREFETCH) as executor:
+    with ThreadPoolExecutor(max_workers=CONCURRENT_PREPARE) as executor:
         futures = {}
+
+        # Worker thread
         for idx, vid_path in enumerate(videos, start=1):
             future = executor.submit(prepare_video, vid_path, args.cut_threshold)
             futures[idx] = future
 
+        # Main thread
         for idx in tqdm(range(1, len(videos) + 1), desc="處理影片", bar_format="{l_bar}{bar:20}{r_bar}\n"):
             vid_ctx = futures[idx].result()  # 等待此影片轉碼完成
+
             count = process_video(clip_ctx, vid_ctx, idx, output_dir, args)
             total_captures += count
-            # 清理暫存檔
+
             if vid_ctx.tmp_dir:
                 shutil.rmtree(vid_ctx.tmp_dir, ignore_errors=True)
 
