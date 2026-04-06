@@ -146,6 +146,14 @@ def format_name(name: str, max_length=50) -> str:
         return name[: max_length - 3] + "..."
 
 
+def load_clip() -> CLIPContext:
+    """載入 CLIP ViT-B/32 模型，自動選擇 device。"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    model.eval()
+    return CLIPContext(model=model, preprocess=preprocess, device=device)
+
+
 def cosine_distance(a, b):
     """計算兩個嵌入向量的餘弦距離 (0=完全相同, 2=完全相反)。"""
     return 1.0 - torch.nn.functional.cosine_similarity(a, b).item()
@@ -171,7 +179,7 @@ def prepare_video(video_path: Path, cut_threshold: float) -> VideoContext:
 
 
 def process_scene(
-    cap: cv2.VideoCapture,
+    reader: cv2.VideoCapture,
     fps: float,
     start_sec: float,
     end_sec: float,
@@ -193,9 +201,9 @@ def process_scene(
     current_time = start_sec
     while current_time < end_sec:
         frame_no = int(current_time * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        ret, frame = cap.read()
-        if not ret:
+        reader.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        success, frame = reader.read()
+        if not success:
             break
         frames.append(frame)
         timestamps.append(current_time)
@@ -228,22 +236,22 @@ def process_scene(
     return captures
 
 
-def process_video(vid_ctx: VideoContext, video_index: int, output_dir: Path, clip_ctx: CLIPContext, args) -> int:
+def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, output_dir: Path, args) -> int:
     """主執行緒 (GPU): 讀幀 + CLIP 推論 + 儲存圖片。"""
     display_name = format_name(vid_ctx.video_path.name)
 
     if vid_ctx.error:
-        log.warning("[%03d] ✗ %s ｜ %s", video_index, display_name, vid_ctx.error)
+        log.warning("[%03d] ✗ %s | %s", vid_idx, display_name, vid_ctx.error)
         return 0
 
     h264_path, scenes = vid_ctx.h264_path, vid_ctx.scenes
 
-    cap = cv2.VideoCapture(h264_path)
-    if not cap.isOpened():
-        log.warning("[%03d] ✗ 無法開啟影片，跳過 ｜ %s", video_index, display_name)
+    reader = cv2.VideoCapture(h264_path)
+    if not reader.isOpened():
+        log.warning("[%03d] ✗ 無法開啟影片，跳過 | %s", vid_idx, display_name)
         return 0
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = reader.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
         fps = 30.0
 
@@ -254,17 +262,17 @@ def process_video(vid_ctx: VideoContext, video_index: int, output_dir: Path, cli
         if total_captures >= args.max_captures:
             break
 
-        captures = process_scene(cap, fps, start_sec, end_sec, clip_ctx, args, total_captures)
+        captures = process_scene(reader, fps, start_sec, end_sec, clip_ctx, args, total_captures)
         all_captures.extend(captures)
 
-    cap.release()
+    reader.release()
 
     for img_idx, (ts, frame) in enumerate(all_captures, start=1):
-        filename = f"{video_index:03d}_{img_idx:03d}.jpg"
+        filename = f"{vid_idx:03d}_{img_idx:03d}.jpg"
         out_path = output_dir / filename
         cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
 
-    log.info("[%03d] %d scenes → %d frames ｜ %s", video_index, len(scenes), len(all_captures), display_name)
+    log.info("[%03d] %d scenes → %d frames | %s", vid_idx, len(scenes), len(all_captures), display_name)
     return len(all_captures)
 
 
@@ -285,13 +293,9 @@ def main():
         videos = videos[: args.limit]
     log.info("共 %d 部影片待處理", len(videos))
 
-    # 載入 CLIP 模型
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("載入 CLIP ViT-B/32 (device=%s)...", device)
-    model, preprocess = clip.load("ViT-B/32", device=device)
-    model.eval()
-    clip_ctx = CLIPContext(model=model, preprocess=preprocess, device=device)
-    log.info("模型載入完成")
+    log.info("載入 CLIP ViT-B/32 中...")
+    clip_ctx = load_clip()
+    log.info("CLIP ViT-B/32 (device=%s) 載入完成", clip_ctx.device)
 
     # Pipeline 並行處理：
     # - Worker thread: ffmpeg 轉碼 + SceneDetect (CPU)
@@ -307,7 +311,7 @@ def main():
 
         for idx in tqdm(range(1, len(videos) + 1), desc="處理影片", bar_format="{l_bar}{bar:20}{r_bar}\n"):
             vid_ctx = futures[idx].result()  # 等待此影片轉碼完成
-            count = process_video(vid_ctx, idx, output_dir, clip_ctx, args)
+            count = process_video(clip_ctx, vid_ctx, idx, output_dir, args)
             total_captures += count
             # 清理暫存檔
             if vid_ctx.tmp_dir:
