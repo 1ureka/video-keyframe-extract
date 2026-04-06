@@ -1,70 +1,72 @@
 # video-keyframe-extract
 
-批量影片關鍵幀擷取工具。針對大量短影片（10–30 秒街景類），自動偵測場景切換與語意變化，擷取代表性關鍵幀。
+A lightweight, opinionated keyframe extraction pipeline for short-form videos.
 
-## 功能
+Designed for high-throughput scenarios (e.g. street-view clips), it combines scene cut detection and CLIP-based semantic filtering to extract representative frames.
 
-- **硬剪輯偵測**：PySceneDetect 精準偵測蒙太奇式場景跳變點
-- **語意差異取樣**：CLIP ViT-B/32 計算幀間語意距離，畫面有實質變化時觸發擷取
-- **最大間隔保底**：連續影片超過設定秒數未擷取，強制捕捉一張
-- **每片上限保護**：每部影片最多擷取 N 張，防止縮時影片過度擷取
+## Features
 
-## 需求
+- **Hard-cut detection**: Detects scene boundaries using PySceneDetect (content-based)
+- **Semantic-diff sampling**: Uses CLIP ViT-B/32 to capture frames when visual semantics change
+- **Max-interval fallback**: Ensures coverage by forcing a capture after a configurable interval
+- **Per-video cap**: Prevents over-extraction by limiting total captures per video
 
-- Docker（需支援 NVIDIA GPU）
-- NVIDIA GPU（已測試 RTX 3060 12GB）
+## Requirements
 
-## 快速開始
+- Docker (with NVIDIA GPU support recommended)
+- NVIDIA GPU (tested on RTX 3060 12GB; CPU fallback is supported but slower)
+
+## Quick Start
 
 ```bash
 # Build
 docker build -t video-extract:latest .
 
-# 小批量測試 (前 5 部)
+# Small batch test (first 5 videos)
 docker run --rm -it --gpus=all --ipc=host -v "${PWD}/:/app" video-extract:latest \
     python extract.py --limit 5
 
-# 全量執行
+# Full run
 docker run --rm -it --gpus=all --ipc=host -v "${PWD}/:/app" video-extract:latest \
     python extract.py
 ```
 
-## 目錄結構
+## Directory Structure
 
 ```
 ├── Dockerfile
 ├── requirements.txt
-├── extract.py          # 主程式
-├── video/              # 輸入影片
-└── output/             # 輸出圖片 ({影片序號}_{圖片序號}.jpg)
+├── extract.py          # Main script
+├── video/              # Input videos
+└── output/             # Output images ({video_index}_{image_index}.jpg)
 ```
 
-## 輸出規則
+## Output Rules
 
-- 影片按檔名字母順序排列，序號 3 位數 zero-padded（`001`, `002`, ...）
-- 圖片序號 3 位數 zero-padded（`001_001.jpg`, `001_002.jpg`, ...）
+- Videos are sorted alphabetically by filename; indices are 3-digit zero-padded (`001`, `002`, ...)
+- Image indices are 3-digit zero-padded (`001_001.jpg`, `001_002.jpg`, ...)
 
-## 可調參數
+## Parameters
 
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `--cut-threshold` | `27.0` | PySceneDetect 硬切偵測靈敏度（越低越敏感） |
-| `--semantic-threshold` | `0.12` | CLIP 語意距離閾值（越低越容易觸發擷取） |
-| `--sample-fps` | `2.0` | 取樣頻率（每秒幾幀） |
-| `--max-interval` | `6.0` | 最大間隔保底（秒），超過則強制擷取 |
-| `--max-captures` | `15` | 每部影片最多擷取張數 |
-| `--jpeg-quality` | `95` | 輸出 JPEG 品質 |
-| `--limit` | `0` | 只處理前 N 部影片（0 = 全部） |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--cut-threshold` | `27.0` | PySceneDetect hard-cut sensitivity (lower = more sensitive) |
+| `--semantic-threshold` | `0.12` | CLIP semantic distance threshold (lower = captures more easily) |
+| `--sample-fps` | `2.0` | Sampling rate (frames per second) |
+| `--max-interval` | `6.0` | Max-interval fallback (seconds); force capture if exceeded |
+| `--max-captures` | `15` | Max captures per video |
+| `--jpeg-quality` | `95` | Output JPEG quality |
+| `--limit` | `0` | Only process first N videos (0 = all) |
 
-### 調參範例
+### Tuning Examples
 
 ```bash
-# 擷取太少 → 降低語意閾值
+# Too few captures -> lower semantic threshold
 python extract.py --semantic-threshold 0.08
 
-# 擷取太多 → 提高語意閾值
+# Too many captures -> raise semantic threshold
 python extract.py --semantic-threshold 0.18
 
-# 一鏡到底影片漏拍 → 縮短最大間隔
+# Single-take video missing frames -> shorten max interval
 python extract.py --max-interval 3.0
 ```
