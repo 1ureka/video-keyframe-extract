@@ -25,13 +25,13 @@ from scenedetect.detectors import ContentDetector
 # Configurable parameters
 
 
-CUT_THRESHOLD = 27.0  # PySceneDetect 硬切偵測靈敏度
-SEMANTIC_THRESHOLD = 0.12  # 語意距離超過此值觸發捕捉
-SAMPLE_FPS = 2.0  # 語意取樣頻率 (每秒幾幀)
-MAX_INTERVAL = 6.0  # 最大間隔 (秒)，超過此時間未捕捉則強制捕捉
-MAX_CAPTURES = 15  # 每部影片最多捕捉張數
-JPEG_QUALITY = 95  # 輸出 JPEG 品質
-CONCURRENT_PREPARE = 2  # 同時轉碼 + 場景偵測的執行緒數
+CUT_THRESHOLD = 27.0  # PySceneDetect hard-cut detection sensitivity
+SEMANTIC_THRESHOLD = 0.12  # Semantic distance above this triggers capture
+SAMPLE_FPS = 2.0  # Semantic sampling rate (frames per second)
+MAX_INTERVAL = 6.0  # Max interval (seconds); force capture if exceeded
+MAX_CAPTURES = 15  # Max captures per video
+JPEG_QUALITY = 95  # Output JPEG quality
+CONCURRENT_PREPARE = 2  # Concurrent transcode + scene detection threads
 
 
 # Logging setup
@@ -75,10 +75,10 @@ class VideoFragment(NamedTuple):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="批量影片關鍵幀擷取")
-    p.add_argument("--video-dir", default="/app/video", help="影片資料夾路徑")
-    p.add_argument("--output-dir", default="/app/output", help="輸出資料夾路徑")
-    p.add_argument("--limit", type=int, default=0, help="只處理前 N 部影片 (0=全部)")
+    p = argparse.ArgumentParser(description="Batch video keyframe extraction")
+    p.add_argument("--video-dir", default="/app/video", help="Path to video directory")
+    p.add_argument("--output-dir", default="/app/output", help="Path to output directory")
+    p.add_argument("--limit", type=int, default=0, help="Only process first N videos (0=all)")
     p.add_argument("--cut-threshold", type=float, default=CUT_THRESHOLD)
     p.add_argument("--semantic-threshold", type=float, default=SEMANTIC_THRESHOLD)
     p.add_argument("--sample-fps", type=float, default=SAMPLE_FPS)
@@ -99,7 +99,7 @@ def format_name(name: str, max_length=50) -> str:
 
 
 def list_videos(video_dir: str) -> list[Path]:
-    """列出影片目錄中的所有 mp4，按檔名字母排序。"""
+    """List all video files in the directory, sorted alphabetically by name."""
     vdir = Path(video_dir)
     exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     videos = [f for f in vdir.iterdir() if f.is_file() and f.suffix.lower() in exts]
@@ -107,7 +107,7 @@ def list_videos(video_dir: str) -> list[Path]:
 
 
 def transcode_to_h264(video_path: str, tmp_dir: str) -> str:
-    """用系統 ffmpeg 將影片轉碼為 H.264，回傳暫存檔路徑。"""
+    """Transcode video to H.264 using system ffmpeg; return temp file path."""
     tmp_path = os.path.join(tmp_dir, "tmp_video.mp4")
 
     cmd_parts1 = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_path]
@@ -115,7 +115,7 @@ def transcode_to_h264(video_path: str, tmp_dir: str) -> str:
     result = subprocess.run(cmd_parts1 + cmd_parts2, capture_output=True, text=True)
 
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg 轉碼失敗: {result.stderr}")
+        raise RuntimeError(f"ffmpeg transcode failed: {result.stderr}")
 
     return tmp_path
 
@@ -124,7 +124,7 @@ def transcode_to_h264(video_path: str, tmp_dir: str) -> str:
 
 
 def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]]:
-    """用 PySceneDetect 偵測硬剪輯場景邊界，回傳 [(start_sec, end_sec), ...]。"""
+    """Detect hard-cut scene boundaries using PySceneDetect; return [(start_sec, end_sec), ...]."""
     video = open_video(video_path)
 
     scene_manager = SceneManager()
@@ -133,7 +133,7 @@ def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]
     scene_list = scene_manager.get_scene_list()
 
     if not scene_list:
-        # 沒偵測到場景切換 → 整部影片視為一個場景
+        # No scene changes detected -> treat entire video as one scene
         duration = video.duration.get_seconds()
         return [(0.0, duration)]
 
@@ -141,7 +141,7 @@ def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]
 
 
 def sample_scene_fragment(reader: cv2.VideoCapture, vid_fps: float, start: float, end: float, sample_fps: float) -> VideoFragment | None:
-    """根據場景邊界按指定頻率取樣幀，回傳 VideoFragment"""
+    """Sample frames from a scene at the specified rate; return VideoFragment."""
     sample_interval = 1.0 / sample_fps
 
     frames = []
@@ -170,7 +170,7 @@ def sample_scene_fragment(reader: cv2.VideoCapture, vid_fps: float, start: float
 
 
 def load_clip() -> CLIPContext:
-    """載入 CLIP ViT-B/32 模型，自動選擇 device。"""
+    """Load CLIP ViT-B/32 model, auto-selecting device."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
     model.eval()
@@ -178,7 +178,7 @@ def load_clip() -> CLIPContext:
 
 
 def compute_clip_embeddings(clip_ctx: CLIPContext, frames_bgr, batch_size=32):
-    """將多個 BGR frames 批量轉成 CLIP 嵌入向量。"""
+    """Batch-convert BGR frames to CLIP embedding vectors."""
     all_embeddings = []
     preprocess, model, device = clip_ctx.preprocess, clip_ctx.model, clip_ctx.device
 
@@ -195,7 +195,7 @@ def compute_clip_embeddings(clip_ctx: CLIPContext, frames_bgr, batch_size=32):
 
 
 def cosine_distance(a, b):
-    """計算兩個嵌入向量的餘弦距離 (0=完全相同, 2=完全相反)。"""
+    """Compute cosine distance between two embedding vectors (0=identical, 2=opposite)."""
     return 1.0 - torch.nn.functional.cosine_similarity(a, b).item()
 
 
@@ -203,7 +203,7 @@ def cosine_distance(a, b):
 
 
 def prepare_video(video_path: Path, cut_threshold: float) -> VideoContext:
-    """將影片轉碼並進行場景偵測，回傳處理影片所需的上下文。"""
+    """Transcode video and perform scene detection; return processing context."""
     tmp_dir = tempfile.mkdtemp()
 
     try:
@@ -219,16 +219,16 @@ def prepare_video(video_path: Path, cut_threshold: float) -> VideoContext:
 
 
 def process_fragment(clip_ctx: CLIPContext, fragment: VideoFragment, total_captures: int, args) -> list[tuple[float, object]]:
-    """對場景取樣片段做 CLIP 語意分析，回傳要捕捉的 (timestamp, frame) 幀列表。"""
+    """Perform CLIP semantic analysis on a scene fragment; return [(timestamp, frame)] to capture."""
     threshold = args.semantic_threshold
 
     embeddings = compute_clip_embeddings(clip_ctx, fragment.frames)
 
-    # 遍歷 embeddings 做捕捉判斷
+    # Iterate embeddings and decide captures
     captures = []
     last_embedding = embeddings[0]
     last_capture_time = fragment.timestamps[0]
-    captures.append((fragment.timestamps[0], fragment.frames[0]))  # 首幀必捕
+    captures.append((fragment.timestamps[0], fragment.frames[0]))  # Always capture first frame
 
     for i in range(1, len(fragment.timestamps)):
         if total_captures + len(captures) >= args.max_captures:
@@ -246,7 +246,7 @@ def process_fragment(clip_ctx: CLIPContext, fragment: VideoFragment, total_captu
 
 
 def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, output_dir: Path, args) -> int:
-    """對單部影片進行 CLIP 分析並儲存捕捉的幀，回傳捕捉的幀數量。"""
+    """Run CLIP analysis on a single video and save captured frames; return capture count."""
     display_name = format_name(vid_ctx.video_path.name)
 
     if vid_ctx.error:
@@ -257,7 +257,7 @@ def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, ou
 
     reader = cv2.VideoCapture(h264_path)
     if not reader.isOpened():
-        log.warning("[%03d] ✗ 無法開啟影片，跳過 | %s", vid_idx, display_name)
+        log.warning("[%03d] ✗ Cannot open video, skipping | %s", vid_idx, display_name)
         return 0
 
     vid_fps = reader.get(cv2.CAP_PROP_FPS)
@@ -300,17 +300,17 @@ def main():
 
     videos = list_videos(args.video_dir)
     if not videos:
-        log.error("在 %s 中找不到任何影片", args.video_dir)
+        log.error("No videos found in %s", args.video_dir)
         sys.exit(1)
 
     if args.limit > 0:
         videos = videos[: args.limit]
 
-    log.info("共 %d 部影片待處理", len(videos))
+    log.info("%d videos to process", len(videos))
 
-    log.info("載入 CLIP ViT-B/32 中...")
+    log.info("Loading CLIP ViT-B/32...")
     clip_ctx = load_clip()
-    log.info("CLIP ViT-B/32 (device=%s) 載入完成", clip_ctx.device)
+    log.info("CLIP ViT-B/32 (device=%s) loaded", clip_ctx.device)
 
     total_captures = 0
 
@@ -323,7 +323,7 @@ def main():
             futures[idx] = future
 
         # Main thread
-        for idx in tqdm(range(1, len(videos) + 1), desc="處理影片", bar_format="{l_bar}{bar:20}{r_bar}\n"):
+        for idx in tqdm(range(1, len(videos) + 1), desc="Processing", bar_format="{l_bar}{bar:20}{r_bar}\n"):
             vid_ctx = futures[idx].result()  # 等待此影片轉碼完成
 
             count = process_video(clip_ctx, vid_ctx, idx, output_dir, args)
@@ -332,7 +332,7 @@ def main():
             if vid_ctx.tmp_dir:
                 shutil.rmtree(vid_ctx.tmp_dir, ignore_errors=True)
 
-    log.info("完成！共擷取 %d 張圖片", total_captures)
+    log.info("Done! %d frames captured in total", total_captures)
 
 
 if __name__ == "__main__":
