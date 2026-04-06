@@ -80,6 +80,16 @@ def parse_args():
     return p.parse_args()
 
 
+def format_name(name: str, max_length=50) -> str:
+    if len(name) <= max_length:
+        return name
+    else:
+        return name[: max_length - 3] + "..."
+
+
+# Video utilities
+
+
 def list_videos(video_dir: str) -> list[Path]:
     """列出影片目錄中的所有 mp4，按檔名字母排序。"""
     vdir = Path(video_dir)
@@ -102,6 +112,9 @@ def transcode_to_h264(video_path: str, tmp_dir: str) -> str:
     return tmp_path
 
 
+# Scene utilities
+
+
 def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]]:
     """用 PySceneDetect 偵測硬剪輯場景邊界，回傳 [(start_sec, end_sec), ...]。"""
     video = open_video(video_path)
@@ -117,6 +130,42 @@ def detect_scenes(video_path: str, threshold: float) -> list[tuple[float, float]
         return [(0.0, duration)]
 
     return [(s[0].get_seconds(), s[1].get_seconds()) for s in scene_list]
+
+
+def sample_frames(
+    reader: cv2.VideoCapture, fps: float, start_sec: float, end_sec: float, sample_fps: float
+) -> tuple[list[float], list]:
+    """從影片片段中按指定頻率取樣幀，回傳 (timestamps, frames)。"""
+    sample_interval = 1.0 / sample_fps
+
+    frames = []
+    timestamps = []
+    current_time = start_sec
+
+    while current_time < end_sec:
+        frame_no = int(current_time * fps)
+        reader.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+
+        success, frame = reader.read()
+        if not success:
+            break
+
+        frames.append(frame)
+        timestamps.append(current_time)
+        current_time += sample_interval
+
+    return timestamps, frames
+
+
+# CLIP utilities
+
+
+def load_clip() -> CLIPContext:
+    """載入 CLIP ViT-B/32 模型，自動選擇 device。"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    model.eval()
+    return CLIPContext(model=model, preprocess=preprocess, device=device)
 
 
 def compute_clip_embeddings(clip_ctx: CLIPContext, frames_bgr, batch_size=32):
@@ -136,22 +185,6 @@ def compute_clip_embeddings(clip_ctx: CLIPContext, frames_bgr, batch_size=32):
         all_embeddings.append(embeddings)
 
     return torch.cat(all_embeddings, dim=0)
-
-
-def format_name(name: str, max_length=50) -> str:
-    """格式化影片名稱，過長則截斷並加省略號。"""
-    if len(name) <= max_length:
-        return name
-    else:
-        return name[: max_length - 3] + "..."
-
-
-def load_clip() -> CLIPContext:
-    """載入 CLIP ViT-B/32 模型，自動選擇 device。"""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = clip.load("ViT-B/32", device=device)
-    model.eval()
-    return CLIPContext(model=model, preprocess=preprocess, device=device)
 
 
 def cosine_distance(a, b):
@@ -179,43 +212,14 @@ def prepare_video(video_path: Path, cut_threshold: float) -> VideoContext:
 
 
 def process_scene(
-    reader: cv2.VideoCapture,
-    fps: float,
-    start_sec: float,
-    end_sec: float,
-    clip_ctx: CLIPContext,
-    args,
-    total_captures: int,
+    clip_ctx: CLIPContext, frames: list, timestamps: list[float], args, total_captures: int
 ) -> list[tuple[float, object]]:
-    """
-    處理單一場景片段，回傳要捕捉的 [(timestamp, frame), ...]。
-    階段 1：收集所有取樣幀，batch 計算 CLIP embeddings。
-    階段 2：遍歷 embeddings 做捕捉判斷。
-    """
-    sample_interval = 1.0 / args.sample_fps
+    """處理單一場景片段，回傳要捕捉的 [(timestamp, frame), ...]。"""
     threshold = args.semantic_threshold
 
-    # 階段 1：收集所有取樣幀
-    frames = []
-    timestamps = []
-    current_time = start_sec
-    while current_time < end_sec:
-        frame_no = int(current_time * fps)
-        reader.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        success, frame = reader.read()
-        if not success:
-            break
-        frames.append(frame)
-        timestamps.append(current_time)
-        current_time += sample_interval
-
-    if not frames:
-        return []
-
-    # batch 計算 embeddings
     embeddings = compute_clip_embeddings(clip_ctx, frames)
 
-    # 階段 2：遍歷 embeddings 做捕捉判斷
+    # 遍歷 embeddings 做捕捉判斷
     captures = []
     last_embedding = embeddings[0]
     last_capture_time = timestamps[0]
@@ -262,7 +266,11 @@ def process_video(clip_ctx: CLIPContext, vid_ctx: VideoContext, vid_idx: int, ou
         if total_captures >= args.max_captures:
             break
 
-        captures = process_scene(reader, fps, start_sec, end_sec, clip_ctx, args, total_captures)
+        timestamps, frames = sample_frames(reader, fps, start_sec, end_sec, args.sample_fps)
+        if not frames:
+            continue
+
+        captures = process_scene(clip_ctx, frames, timestamps, args, total_captures)
         all_captures.extend(captures)
 
     reader.release()
@@ -304,10 +312,10 @@ def main():
     PREFETCH = 2  # 最多預轉碼幾部
 
     with ThreadPoolExecutor(max_workers=PREFETCH) as executor:
-        # 提交所有轉碼任務（ThreadPoolExecutor 會自動排隊）
-        futures = {
-            idx: executor.submit(prepare_video, vp, args.cut_threshold) for idx, vp in enumerate(videos, start=1)
-        }
+        futures = {}
+        for idx, vid_path in enumerate(videos, start=1):
+            future = executor.submit(prepare_video, vid_path, args.cut_threshold)
+            futures[idx] = future
 
         for idx in tqdm(range(1, len(videos) + 1), desc="處理影片", bar_format="{l_bar}{bar:20}{r_bar}\n"):
             vid_ctx = futures[idx].result()  # 等待此影片轉碼完成
