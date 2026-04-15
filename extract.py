@@ -85,6 +85,7 @@ def parse_args():
     p.add_argument("--max-interval", type=float, default=MAX_INTERVAL)
     p.add_argument("--max-captures", type=int, default=MAX_CAPTURES)
     p.add_argument("--jpeg-quality", type=int, default=JPEG_QUALITY)
+    p.add_argument("--start-index", type=int, default=1, help="Starting video index number (default: 1, for incremental updates)")
     return p.parse_args()
 
 
@@ -314,16 +315,18 @@ def main():
 
     total_captures = 0
 
+    start = args.start_index
+
     with ThreadPoolExecutor(max_workers=CONCURRENT_PREPARE) as executor:
         futures = {}
 
         # Worker thread
-        for idx, vid_path in enumerate(videos, start=1):
+        for idx, vid_path in enumerate(videos, start=start):
             future = executor.submit(prepare_video, vid_path, args.cut_threshold)
             futures[idx] = future
 
         # Main thread
-        for idx in tqdm(range(1, len(videos) + 1), desc="Processing", bar_format="{l_bar}{bar:20}{r_bar}\n"):
+        for idx in tqdm(range(start, start + len(videos)), desc="Processing", bar_format="{l_bar}{bar:20}{r_bar}\n"):
             vid_ctx = futures[idx].result()  # 等待此影片轉碼完成
 
             count = process_video(clip_ctx, vid_ctx, idx, output_dir, args)

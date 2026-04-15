@@ -56,7 +56,20 @@ docker run --rm -it --gpus=all --ipc=host -v "${PWD}/:/app" video-extract:latest
 | `--max-interval` | `6.0` | Max-interval fallback (seconds); force capture if exceeded |
 | `--max-captures` | `15` | Max captures per video |
 | `--jpeg-quality` | `95` | Output JPEG quality |
+| `--start-index` | `1` | Starting video index number (for incremental updates) |
 | `--limit` | `0` | Only process first N videos (0 = all) |
+
+### Incremental Updates
+
+When adding new videos to an existing batch, use `--start-index` to continue numbering from where you left off:
+
+```bash
+# First batch: 50 videos → output 001_*.jpg ~ 050_*.jpg
+python extract.py
+
+# Add more videos, continue from index 51
+python extract.py --start-index 51
+```
 
 ### Tuning Examples
 
